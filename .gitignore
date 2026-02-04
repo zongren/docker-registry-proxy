@@ -1,0 +1,24 @@
+# Generated directories
+cache/
+ssl/
+certbot/
+
+# CA certificates (keep certs/ for the proxy-generated CA)
+certs/
+
+# Environment files with secrets
+.env
+
+# Logs
+*.log
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
