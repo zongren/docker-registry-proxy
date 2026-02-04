@@ -5,6 +5,9 @@ services:
     image: rpardini/docker-registry-proxy:latest
     container_name: docker-registry-proxy
     restart: always
+    ports:
+      # Expose proxy port directly (nginx will reverse proxy to this)
+      - "3128:3128"
     volumes:
       - ./cache:/docker_mirror_cache
       - ./certs:/ca
@@ -18,36 +21,7 @@ services:
       - DEBUG=false
       # Cache expiration (default: 60 days)
       - CACHE_MAX_SIZE=100g
-    networks:
-      - proxy-network
 
-  nginx:
-    image: nginx:alpine
-    container_name: nginx-proxy
-    restart: always
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - ./ssl:/etc/nginx/ssl:ro
-      - ./certbot/www:/var/www/certbot:ro
-      - ./certbot/conf:/etc/letsencrypt:ro
-    depends_on:
-      - docker-registry-proxy
-    networks:
-      - proxy-network
-
-  # Certbot for Let's Encrypt SSL certificates
-  certbot:
-    image: certbot/certbot
-    container_name: certbot
-    volumes:
-      - ./certbot/www:/var/www/certbot
-      - ./certbot/conf:/etc/letsencrypt
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
-
-networks:
-  proxy-network:
-    driver: bridge
+# Note: This compose file is designed to work with existing host nginx.
+# Do NOT run the nginx container if you have nginx on the host.
+# See nginx-site.conf for the host nginx configuration.

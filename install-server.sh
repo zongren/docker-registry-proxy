@@ -1,6 +1,6 @@
 #!/bin/bash
-# Docker Registry Proxy - Server Installation Script
-# One-line install: curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/docker-registry-proxy/main/install-server.sh | bash -s -- your-domain.com your-email@example.com
+# Docker Registry Proxy - Server Installation Script (for servers with existing nginx)
+# One-line install: curl -fsSL https://raw.githubusercontent.com/zongren/docker-registry-proxy/main/install-server.sh | bash -s -- your-domain.com your-email@example.com
 #
 # Requirements:
 # - Debian 12 (bookworm)
@@ -12,6 +12,7 @@
 # - Install git, docker, certbot if not present
 # - Check if nginx site already exists (exit with error if so)
 # - NOT modify existing nginx configurations or certificates
+# - Add a new nginx site for the proxy domain
 # - Deploy the docker-registry-proxy
 
 set -e
@@ -84,14 +85,14 @@ fi
 
 # Check if domain is configured in any nginx config
 if command -v nginx &> /dev/null; then
-    if grep -r "server_name.*$DOMAIN" /etc/nginx/sites-available/ /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null; then
+    if grep -r "server_name.*[[:space:]]$DOMAIN" /etc/nginx/sites-available/ /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null | grep -v "^#"; then
         log_error "Domain '$DOMAIN' is already configured in nginx!"
         log_error "Please remove the existing configuration or use a different domain."
         exit 1
     fi
 fi
 
-log_info "No existing nginx configuration found for $DOMAIN"
+log_info "No existing nginx configuration found for $DOMAIN ✓"
 
 # ============================================
 # Check for existing SSL certificates
@@ -115,7 +116,7 @@ if ! command -v git &> /dev/null; then
     log_info "Installing git..."
     $SUDO apt-get install -y -qq git
 else
-    log_info "git is already installed"
+    log_info "git is already installed ✓"
 fi
 
 # Install curl if not present
@@ -123,7 +124,17 @@ if ! command -v curl &> /dev/null; then
     log_info "Installing curl..."
     $SUDO apt-get install -y -qq curl
 else
-    log_info "curl is already installed"
+    log_info "curl is already installed ✓"
+fi
+
+# Install nginx if not present
+if ! command -v nginx &> /dev/null; then
+    log_info "Installing nginx..."
+    $SUDO apt-get install -y -qq nginx
+    $SUDO systemctl enable nginx
+    $SUDO systemctl start nginx
+else
+    log_info "nginx is already installed ✓"
 fi
 
 # Install Docker if not present
@@ -154,9 +165,9 @@ if ! command -v docker &> /dev/null; then
     $SUDO systemctl start docker
     $SUDO systemctl enable docker
     
-    log_info "Docker installed successfully!"
+    log_info "Docker installed successfully ✓"
 else
-    log_info "Docker is already installed"
+    log_info "Docker is already installed ✓"
     
     # Ensure docker compose plugin is available
     if ! docker compose version &> /dev/null; then
@@ -165,12 +176,12 @@ else
     fi
 fi
 
-# Install certbot if not present (standalone, not nginx plugin)
+# Install certbot if not present
 if ! command -v certbot &> /dev/null; then
     log_info "Installing certbot..."
-    $SUDO apt-get install -y -qq certbot
+    $SUDO apt-get install -y -qq certbot python3-certbot-nginx
 else
-    log_info "certbot is already installed"
+    log_info "certbot is already installed ✓"
 fi
 
 # ============================================
@@ -192,15 +203,61 @@ fi
 # Create directory structure
 # ============================================
 log_info "Creating directory structure..."
-$SUDO mkdir -p cache certs ssl certbot/www certbot/conf
+$SUDO mkdir -p cache certs ssl
 
 # ============================================
-# Configure nginx virtual host
+# Start docker-registry-proxy container
 # ============================================
-log_info "Configuring nginx for $DOMAIN..."
+log_info "Starting docker-registry-proxy container..."
+$SUDO docker compose up -d
 
-# Update domain in nginx config
-$SUDO sed -i "s/YOUR_DOMAIN_HERE/$DOMAIN/g" nginx/conf.d/default.conf 2>/dev/null || true
+# Wait for container to be ready
+log_info "Waiting for container to initialize..."
+sleep 5
+
+# Copy CA certificate for distribution
+log_info "Extracting CA certificate..."
+$SUDO docker cp docker-registry-proxy:/ca/ca.crt ./ssl/ca.crt 2>/dev/null || {
+    log_warn "CA cert not ready yet, retrying..."
+    sleep 5
+    $SUDO docker cp docker-registry-proxy:/ca/ca.crt ./ssl/ca.crt 2>/dev/null || log_error "Failed to extract CA cert"
+}
+$SUDO chmod 644 ssl/ca.crt 2>/dev/null || true
+
+# ============================================
+# Configure nginx site
+# ============================================
+log_info "Configuring nginx site for $DOMAIN..."
+
+# Create nginx site config from template
+$SUDO cp nginx-site.conf /etc/nginx/sites-available/$DOMAIN
+$SUDO sed -i "s/YOUR_DOMAIN_HERE/$DOMAIN/g" /etc/nginx/sites-available/$DOMAIN
+
+# For certbot to work, we need a temporary config without SSL first
+$SUDO cat > /etc/nginx/sites-available/$DOMAIN << EOF
+# Temporary config for certbot - will be replaced after certificate is obtained
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 200 'Waiting for SSL certificate...\n';
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+
+# Enable the site
+$SUDO ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/$DOMAIN
+
+# Test and reload nginx
+$SUDO nginx -t
+$SUDO systemctl reload nginx
 
 # ============================================
 # Get SSL certificate (if not exists)
@@ -208,48 +265,137 @@ $SUDO sed -i "s/YOUR_DOMAIN_HERE/$DOMAIN/g" nginx/conf.d/default.conf 2>/dev/nul
 if [ "$EXISTING_CERTS" = false ]; then
     log_info "Obtaining SSL certificate from Let's Encrypt..."
     
-    # Create temporary self-signed cert for initial nginx startup
-    $SUDO mkdir -p certbot/conf/live/$DOMAIN
-    $SUDO openssl req -x509 -nodes -newkey rsa:4096 -days 1 \
-        -keyout certbot/conf/live/$DOMAIN/privkey.pem \
-        -out certbot/conf/live/$DOMAIN/fullchain.pem \
-        -subj "/CN=$DOMAIN" 2>/dev/null
-
-    # Start nginx temporarily for certbot challenge
-    $SUDO docker compose up -d nginx
-    sleep 5
-
-    # Get real certificate
-    $SUDO docker compose run --rm certbot certonly \
-        --webroot \
-        --webroot-path=/var/www/certbot \
-        --email "$EMAIL" \
+    $SUDO certbot --nginx \
+        --non-interactive \
         --agree-tos \
-        --no-eff-email \
-        -d "$DOMAIN"
-
-    # Restart with real certificate
-    $SUDO docker compose down
+        --email "$EMAIL" \
+        --domains "$DOMAIN" \
+        --redirect
 else
     log_info "Using existing SSL certificates for $DOMAIN"
-    # Link existing certificates
-    $SUDO mkdir -p certbot/conf/live
-    $SUDO ln -sf /etc/letsencrypt/live/$DOMAIN certbot/conf/live/$DOMAIN 2>/dev/null || true
 fi
 
 # ============================================
-# Start services
+# Create final nginx config with SSL
 # ============================================
-log_info "Starting docker-registry-proxy services..."
-$SUDO docker compose up -d
+log_info "Applying final nginx configuration..."
 
-# Wait for services to be ready
-sleep 5
+$SUDO cat > /etc/nginx/sites-available/$DOMAIN << EOF
+# Docker Registry Proxy - $DOMAIN
+# Generated by install-server.sh
 
-# Copy CA certificate for distribution
-log_info "Extracting CA certificate..."
-$SUDO docker cp docker-registry-proxy:/ca/ca.crt ./ssl/ca.crt 2>/dev/null || log_warn "CA cert will be available shortly"
-$SUDO chmod 644 ssl/ca.crt 2>/dev/null || true
+# HTTP server - redirect to HTTPS and Let's Encrypt challenge
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $DOMAIN;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+# HTTPS server - main proxy endpoint
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name $DOMAIN;
+
+    # SSL certificates (managed by Certbot)
+    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Status page
+    location /status {
+        return 200 'Docker Registry Proxy is running\n';
+        add_header Content-Type text/plain;
+    }
+
+    # Health check
+    location /health {
+        return 200 'OK\n';
+        add_header Content-Type text/plain;
+    }
+
+    # CA certificate download (for clients to trust)
+    location /ca.crt {
+        alias $INSTALL_DIR/ssl/ca.crt;
+        add_header Content-Type application/x-x509-ca-cert;
+    }
+
+    # Client setup script download
+    location /install-client.sh {
+        alias $INSTALL_DIR/install-client.sh;
+        add_header Content-Type text/plain;
+    }
+
+    # PowerShell client setup script
+    location /install-client.ps1 {
+        alias $INSTALL_DIR/install-client.ps1;
+        add_header Content-Type text/plain;
+    }
+
+    # Proxy to docker-registry-proxy container
+    location / {
+        proxy_pass http://127.0.0.1:3128;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # For large Docker images
+        proxy_connect_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+        
+        # Disable buffering for streaming
+        proxy_buffering off;
+        proxy_request_buffering off;
+        client_max_body_size 0;
+    }
+}
+EOF
+
+# Test and reload nginx
+$SUDO nginx -t
+$SUDO systemctl reload nginx
+
+# ============================================
+# Verify services are running
+# ============================================
+log_info "Verifying services..."
+
+# Check docker container
+if docker ps | grep -q "docker-registry-proxy"; then
+    log_info "Docker container is running ✓"
+else
+    log_error "Docker container is NOT running!"
+    docker compose logs
+    exit 1
+fi
+
+# Check nginx
+if systemctl is-active --quiet nginx; then
+    log_info "Nginx is running ✓"
+else
+    log_error "Nginx is NOT running!"
+    exit 1
+fi
+
+# Test HTTPS endpoint
+sleep 2
+if curl -sSf "https://$DOMAIN/health" &>/dev/null; then
+    log_info "HTTPS endpoint is accessible ✓"
+else
+    log_warn "HTTPS endpoint test failed (may need DNS propagation)"
+fi
 
 # ============================================
 # Setup complete
@@ -261,19 +407,25 @@ log_info "=========================================="
 echo ""
 log_info "Docker Registry Proxy is now running at:"
 echo "  - HTTPS: https://$DOMAIN"
-echo "  - Proxy port: $DOMAIN:3128"
+echo "  - Proxy port: $DOMAIN:3128 (via nginx)"
 echo ""
 log_info "To configure Docker clients, run:"
 echo ""
 echo "  # Linux (Debian/Ubuntu):"
-echo "  curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/docker-registry-proxy/main/install-client.sh | bash -s -- $DOMAIN"
+echo "  curl -fsSL https://$DOMAIN/install-client.sh | bash -s -- $DOMAIN"
 echo ""
-echo "  # macOS/Windows (Docker Desktop):"
-echo "  curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/docker-registry-proxy/main/install-client.sh | bash -s -- $DOMAIN"
+echo "  # macOS:"
+echo "  curl -fsSL https://$DOMAIN/install-client.sh | bash -s -- $DOMAIN"
+echo ""
+echo "  # Windows PowerShell (as Administrator):"
+echo '  $env:PROXY_HOST="'$DOMAIN'"; irm https://'$DOMAIN'/install-client.ps1 | iex'
 echo ""
 log_info "Management commands:"
 echo "  cd $INSTALL_DIR"
-echo "  docker compose logs -f      # View logs"
-echo "  docker compose restart      # Restart services"
-echo "  docker compose down         # Stop services"
+echo "  docker compose logs -f      # View container logs"
+echo "  docker compose restart      # Restart container"
+echo "  docker compose down         # Stop container"
+echo "  sudo systemctl reload nginx # Reload nginx"
+echo ""
+log_info "Nginx site config: /etc/nginx/sites-available/$DOMAIN"
 echo ""
