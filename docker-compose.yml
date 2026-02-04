@@ -13,7 +13,8 @@ services:
       - ./certs:/ca
     environment:
       # Registries to proxy (space-separated)
-      - REGISTRIES=registry-1.docker.io ghcr.io mcr.microsoft.com gcr.io quay.io
+      # NOTE: registry-1.docker.io (Docker Hub) is included by default, don't add it here
+      - REGISTRIES=ghcr.io mcr.microsoft.com gcr.io quay.io
       # Optional: Upstream HTTP proxy if your server needs it
       # - HTTP_PROXY=http://your-upstream-proxy:8080
       # - HTTPS_PROXY=http://your-upstream-proxy:8080
