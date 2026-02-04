@@ -227,34 +227,68 @@ EOF
     macos)
         log_info "Configuring Docker Desktop for macOS..."
         
-        # Docker Desktop on macOS uses ~/.docker/config.json
+        # Docker Desktop on macOS needs configuration in multiple places:
+        # 1. ~/.docker/daemon.json for the Docker daemon
+        # 2. The Docker Desktop settings.json for the GUI
+        
         DOCKER_CONFIG_DIR="$HOME/.docker"
-        DOCKER_CONFIG="$DOCKER_CONFIG_DIR/config.json"
+        DAEMON_CONFIG="$DOCKER_CONFIG_DIR/daemon.json"
         
         mkdir -p "$DOCKER_CONFIG_DIR"
         
-        if [ -f "$DOCKER_CONFIG" ]; then
-            # Backup existing config
-            cp "$DOCKER_CONFIG" "$DOCKER_CONFIG.backup"
-            log_info "Backed up existing config to $DOCKER_CONFIG.backup"
+        # Configure daemon.json with proxy settings
+        log_info "Configuring Docker daemon proxy settings..."
+        
+        if [ -f "$DAEMON_CONFIG" ]; then
+            cp "$DAEMON_CONFIG" "$DAEMON_CONFIG.backup"
+            log_info "Backed up existing daemon.json to $DAEMON_CONFIG.backup"
             
-            # Check if proxies already configured
-            if grep -q '"proxies"' "$DOCKER_CONFIG"; then
-                log_warn "Proxy configuration already exists in $DOCKER_CONFIG"
-                log_warn "Please manually update the proxy settings in Docker Desktop:"
-                echo "  1. Open Docker Desktop"
-                echo "  2. Go to Settings → Resources → Proxies"
-                echo "  3. Enable 'Manual proxy configuration'"
-                echo "  4. Set HTTP Proxy: http://${PROXY_HOST}:${PROXY_PORT}"
-                echo "  5. Set HTTPS Proxy: http://${PROXY_HOST}:${PROXY_PORT}"
-                echo "  6. Click 'Apply & Restart'"
-            else
-                # Add proxy configuration using Python (available on macOS)
-                python3 << PYEOF
+            # Use Python to merge proxy settings into existing config
+            python3 << PYEOF
 import json
 import os
 
-config_path = os.path.expanduser("$DOCKER_CONFIG")
+config_path = "$DAEMON_CONFIG"
+try:
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+# Add proxy settings (these work for Docker daemon)
+config['proxies'] = {
+    'http-proxy': 'http://${PROXY_HOST}:${PROXY_PORT}',
+    'https-proxy': 'http://${PROXY_HOST}:${PROXY_PORT}',
+    'no-proxy': 'localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local'
+}
+
+with open(config_path, 'w') as f:
+    json.dump(config, f, indent=2)
+
+print("Updated", config_path)
+PYEOF
+        else
+            cat << EOF > "$DAEMON_CONFIG"
+{
+  "proxies": {
+    "http-proxy": "http://${PROXY_HOST}:${PROXY_PORT}",
+    "https-proxy": "http://${PROXY_HOST}:${PROXY_PORT}",
+    "no-proxy": "localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local"
+  }
+}
+EOF
+            log_info "Created $DAEMON_CONFIG with proxy settings"
+        fi
+        
+        # Also configure ~/.docker/config.json for container proxy settings
+        DOCKER_CONFIG="$DOCKER_CONFIG_DIR/config.json"
+        if [ -f "$DOCKER_CONFIG" ]; then
+            cp "$DOCKER_CONFIG" "$DOCKER_CONFIG.backup.config"
+            python3 << PYEOF
+import json
+import os
+
+config_path = "$DOCKER_CONFIG"
 try:
     with open(config_path, 'r') as f:
         config = json.load(f)
@@ -272,11 +306,9 @@ config['proxies'] = {
 with open(config_path, 'w') as f:
     json.dump(config, f, indent=2)
 
-print("Proxy configuration added to", config_path)
+print("Updated", config_path)
 PYEOF
-            fi
         else
-            # Create new config
             cat << EOF > "$DOCKER_CONFIG"
 {
   "proxies": {
@@ -288,13 +320,28 @@ PYEOF
   }
 }
 EOF
-            log_info "Created Docker config with proxy settings"
+            log_info "Created $DOCKER_CONFIG with proxy settings"
         fi
         
+        log_info "Proxy configuration files updated"
+        
         echo ""
-        log_warn "Please restart Docker Desktop for changes to take effect:"
+        log_warn "==========================================="
+        log_warn "IMPORTANT: Manual steps required!"
+        log_warn "==========================================="
+        echo ""
+        echo "Docker Desktop on macOS requires manual proxy configuration:"
+        echo ""
         echo "  1. Click the Docker icon in the menu bar"
-        echo "  2. Select 'Restart'"
+        echo "  2. Select 'Settings' (or 'Preferences')"
+        echo "  3. Go to 'Resources' → 'Proxies'"
+        echo "  4. Enable 'Manual proxy configuration'"
+        echo "  5. Set HTTP Proxy:  http://${PROXY_HOST}:${PROXY_PORT}"
+        echo "  6. Set HTTPS Proxy: http://${PROXY_HOST}:${PROXY_PORT}"
+        echo "  7. Set Bypass: localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+        echo "  8. Click 'Apply & Restart'"
+        echo ""
+        log_info "After configuring, test with: docker pull nginx:alpine"
         echo ""
         ;;
         
